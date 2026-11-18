@@ -227,3 +227,113 @@ VCU 端用 CANopen,透過 `src/canopen/msg.c` 把物件字典項目(如 0x2111�
 3. 預設綁定改為 `127.0.0.1` 或 Tailscale 介面;CORS 限定實際來源,並把 `allow_credentials` 關掉。
 4. 檢查 WebSocket 的 `Origin`。
 5. 以 pydantic 模型限制欄位型別與大小。
+
+---
+
+## 9. 韌體核心深入分析:馬達控制 / 通訊 / 核心 / 儀表板(2026-11 補充)
+
+> 方法:四條平行的靜態讀碼分析(沒有上機或實測)。標「已核對」的是我事後回頭讀原始碼確認過的項目;其餘為分析過程的結論,尚未獨立複核。「未驗證」代表需要實機、示波器或網表才能確認。
+> 範圍:`nturt_INV_STM32H743ZI`、`nturt_vcu`、`nturt_zephyr_common`、`Dashboard_Games`、`RPI_Desktop`。
+
+### 9.1 最優先處理清單
+
+| # | 嚴重度 | 項目 | 位置 | 狀態 |
+|---|---|---|---|---|
+| 1 | 高 | **RPDO 映射複製貼上錯誤**:FR 狀態 RPDO 的第 3 個物件指向 FL 轉速(`0x2113:2`,應為 `0x2123:2`);RL 的指向 FR 轉速(`0x2123:2`,應為 `0x2133:2`)。結果 FL、FR 轉速被覆蓋,**RL 轉速永遠不更新**。會餵錯誤輪速給循跡控制與感測器融合。 | `nturt_vcu/src/canopen/objdict/OD.c:363,396` | 已核對 |
+| 2 | 高 | **逆變器 RMS 過流保護永遠不會觸發**:`RMS_sum` 是 `uint32_t`,累加 10000 筆 0.01 A 單位的平方;門檻 `36000000`(對應 60 A)比較的是 `RMS_sum/10000`,左邊最大約 429,496,條件不可能成立。實際約 6.5 A RMS 就會溢位。 | `main.c:119,1071-1087`、`config.h:31` | 已核對 |
+| 3 | 高 | **FL/FR 逆變器心跳消費者被停用**(時間為 0),只有 RL/RR 為 500 ms。前輪逆變器失聯時 VCU 沒有錯誤,且 RPDO 無逾時,舊狀態一直留著。 | `OD.c:204` | 已核對 |
+| 4 | 高 | **APPS 兩顆感測器偏差檢查被關閉**:`dev-tolerance` 被註解,預設為停用。等同缺少 Formula Student「10% / 100 ms」APPS 合理性規則(只剩單顆超出範圍檢查)。 | `nturt_vcu/app.overlay:49` | 已核對 |
+| 5 | 高 | **RTD 蜂鳴器被註解**:RTD 不會發聲。若比賽規則要求 RTD 聲響則不合規。 | `src/dashboard/peripherals.c:172` | 已核對 |
+| 6 | 高 | **RTD_FORCED 繞過所有檢查**:可從 ERROR 狀態進入 RTD_SOUND,不需踩煞車。進入 RUNNING_OK 後,已存在的錯誤因為只在「置位/清除事件」觸發,不會重新評估,可能帶著 ERROR 級錯誤行駛(靜態推論)。 | `states/states.c:178`、`ctrl.c:272`、`normal.c:209` | 未實測 |
+| 7 | 高 | **逆變器 CAN 收幀緩衝區 6 位元組**,HAL 最多會複製 8 位元組;過濾器為 `DUAL`,第二個 ID 是 0x7FF,所以 ID 0x7FF 的幀也會被收進來,可蓋掉堆疊。 | `main.c:1169`、`1372-1374` | 已核對 |
+| 8 | 高 | **逆變器扭矩斜坡無效**:`max_ramp = 1/FREQ/RAMP_TIME_DERATE` 為整數除法,結果為 0;且限幅後的 `last_percent` 立刻被 `percent_torque_requested` 覆蓋。扭矩指令會瞬間套用。 | `main.c:207,769-770`、`config.h:69,94` | 已核對 |
+| 9 | 高 | **疑似 ABBA 死結(儀表板鎖 ↔ 控制鎖)**:儀表板持鎖呼叫 `ctrl_ctrl_change_gear()`(以 `K_FOREVER` 取控制鎖),同時控制緒持控制鎖發佈 `msg_ctrl_states`,儀表板監聽器又取儀表板鎖。同按左右鍵撞上 10 ms 週期可能永久卡住控制迴圈。 | `normal.c:193,221`、`ctrl.c:123,175,193` | 依鎖順序推論,未驗證 |
+| 10 | 高 | **逆變器低壓故障 ISR 內有 `f_sync` 與無限迴圈**,優先權與控制 ISR 同為 0,無法搶占,PWM 停在最後占空比;看門狗模組未啟用。 | `main.c:1149-1153`、`gpio.c:128`、`tim.c:248` | 未驗證 |
+
+### 9.2 馬達控制(`nturt_INV_STM32H743ZI`)
+
+**架構:** FOC + 中點箝位 SVPWM,電流 PI 輸出 Uq/Ud,含母線電壓補償;TIM1 中央對齊,`FREQ=23000`,ISR 每兩個更新事件執行一次。Id 目標固定為 0,**沒有弱磁**,也沒有 ωL 解耦與反電動勢前饋。
+
+**需注意:**
+- **ADC 未與 PWM 同步**:三個 ADC 都是軟體啟動、連續轉換、DMA 循環,TIM1 未輸出 TRGO。ISR 讀的是「最新值」而非中心點取樣,電流量測會帶入開關雜訊與相位誤差(中)。
+- **PI 積分幾乎沒作用**:`QKP=2.4`、`QKI=1.5`,Ki/Kp ≈ 0.6 s⁻¹;被註解掉的 MATLAB 調法比值約 320 s⁻¹。目前近似純 P 控制,穩態電流誤差未驗證(中)。
+- **軟體電流限制是死碼**:`IqOC_controller_output` 算出後從未使用,`max_derate` 也未使用。扭矩命令 `torque_command/1000` 沒有限幅(範圍約 ±32.7),只剩 72 A 的瞬時跳脫兜底;而滿額指令是 70 A,裕度僅 2 A,滿扭矩加上漣波可能誤跳。
+- **沒有母線過壓/欠壓保護**:只在啟用瞬間檢查是否 ≥ 20 V。
+- **逆變器過溫保護被註解**(`main.c:1506`),只剩馬達溫度保護;馬達低於 5 ℃ 也會跳錯誤。需確認硬體 OTP 是否獨立足夠。
+- **故障清除不驗證條件**:一個 CAN 位元即回 READY;硬體 SR 閂鎖的重置路徑在韌體中看不到(未驗證)。
+- **PWM 死區為 0、TIM1 break 輸入關閉**:防直通是否完全靠閘極驅動器的硬體死區需確認(未驗證)。
+- **編碼器**:用 ADC2 四通道差分 sin/cos 做 `atan2`;AS5048A 驅動整檔被註解;**沒有 sin/cos 的偏移/增益/相位校正**,誤差會變成扭矩漣波。`pole_pairs=1` 但轉速公式寫死 `/4`,換 EP7 的 LDC5072 感測板時極易出錯。
+- **零位與電流標定**:`ZERO_ELECTRIC_ANGLE`、`MOT_CURR` 只定義了 CAL、RR、RL;選 `MOT_FL`/`MOT_FR` 會編譯失敗(未驗證),代表前輪逆變器的標定值不在這個倉庫。`CAL_ZERO_ANGLE` 路徑已損壞(以 2 個參數呼叫 4 參數函式)。
+- **電流換算係數疑點**:`DCAPLSB` 註解隱含 ADC 滿量程 2048,但 ADC 是 12 位元(4096),若公式正確現值差 2 倍;所有電流閾值都依賴它(待用實測電流校驗)。
+- **調參封包**(CAN 0x200)可改 PID 與零位,RUNNING 時被擋,但無範圍檢查、無 `MOT_ID` 過濾(廣播同時改全部)、只存 RAM。`pid.c:26` 在 P=0 時產生 NaN。
+- **日誌**:`index_to_sd` 無上限,SD 寫入卡頓超過約 156 ms 會讀出緩衝區範圍;`speed_rad`、`angle_pll` 從未賦值卻被記錄。
+- **ISR 內雙精度數學**(`sin`、`cos`、`sqrt`、`fmod`)與每週期讀 RTC,耗時未量測(`TIMING` 巨集關閉)。
+
+### 9.3 通訊(CANopen 與逆變器介面)
+
+**VCU 的 CANopen:** VCU 為 node 0x01;節點表為 BMS 0x10、逆變器 0x11–0x14、RPi 0x04、IMU 0x08、GPS 0x09。心跳生產 100 ms;RPDO 為 `transmissionType=0xFE`、`eventTimer=0`,**沒有逐 PDO 逾時**。aggregation 的 `K_MSEC(100)/(80)/(30)` 是「發佈週期 / 最小間隔 / watermark」,**不是失聯逾時**:到了 watermark 資料沒更新完也照發,所以下游不會得知資料是舊的。
+
+**VCU↔逆變器介面核對結果(一致的部分):** 控制幀 ID(VCU TPDO 0x211–0x214 ↔ 逆變器過濾 `0x210+MOT_ID`)、小端序、控制字位元(enable = bit3、fault reset = bit5)、扭矩縮放(×1000 / 額定 20 Nm)、狀態幀 0x19x 與 RPDO 0x191–0x194。方向由 VCU 的 `PARAM_MOTOR_DIR`(FL +1、FR −1、RL −1、RR +1)負責,逆變器端 `dir` 寫死為 1,逆變器 Iq 的符號關係未驗證。
+
+**失聯行為:**
+- 逆變器收不到控制幀:約 1 秒後關閘極並回 READY(`main.c:1096` 用 `==` 比較,只在計數剛好等於 `freq` 的那一個週期觸發)。建議縮短到 50–100 ms,並讓逆變器監看 VCU 心跳 / NMT。
+- VCU 收不到逆變器心跳:RL/RR 500 ms 後 `hb_inv_*`(ERROR)進入 ERROR 狀態;FL/FR 無偵測(見 9.1 第 3 項)。
+- **BMS 失聯不會被偵測**:0x1016 沒有 node 0x10,且 `hb_acc` 僅為 WARN。
+
+**DBC 與實作的不一致:**
+- 扭矩回授縮放:DBC 為 0.025 Nm/count;VCU 為 0.001×20 = 0.02;逆變器實送的是 `Iq/max_current×1000`(電流比例而非扭矩)。
+- `INV_STATUS`:DBC 把 bit 1–3 當 3 位元列舉,韌體是三個獨立旗標;狀態幀第 2 位元組 `error_state` 在 DBC 中沒有定義。
+- BMS 心跳 DBC 寫 DLC 8,CANopen 規範為 1 位元組。檔名為 EP6,是否已更新到 EP7 未驗證。
+
+**其他:** `control` 遙測群組被停用(TPDO 0x1803 的 COB-ID 為 `0xC0000480`,bit31 = 無效,映射全空),slip ratio、yaw rate 實際不送出。`inv.c:129-134` 在**任何**逆變器錯誤事件時立刻對**四顆**逆變器送 fault reset,持續性故障可能被反覆清除。`MOT_CAL` 建置的 `MOT_ID=0` 會與 BMS(0x190、0x710)撞 ID;逆變器 ID 要靠改 `config.h` 重編,寫錯無法在執行期察覺。
+
+**總線負載估算:** 約 175–215 kbit/s,即 1 Mbit/s 的 18–22%,餘裕充足。扭矩指令(0x21x)優先權低於狀態與心跳(0x19x、0x181、0x281),負載低時無影響,日後增加流量需重新檢視。
+
+### 9.4 VCU 核心與安全邏輯
+
+**狀態機:** 命令為 PEDAL / PEDAL_CLEAR(RTD_BLINK ↔ RTD_STEADY)、RTD(→ RTD_SOUND)、RTD_FINISH(→ RUNNING)、RTD_FORCED、ERROR / FATAL_ERROR、ERROR_RUNNING / CLEARED_RUNNING、DISABLE。扭矩非零只可能在 `RUNNING_OK` 且油門 > 0;RUNNING_ERROR 時輸入與輸出扭矩都歸零,逆變器 ENABLE 位綁在 RUNNING_OK,這部分設計合理。
+
+**安全稽核重點:**
+- **煞車/油門合理性**符合 EV4.7 概念(25% 啟動、5% 釋放,Kconfig 預設開啟)。
+- **感測器錯誤不閂鎖**:APPS1/2、BSE1/2 個別錯誤為 INFO,只有聚合後的 ACCEL/BRAKE(ERROR)進 ERROR;感測器恢復就自動清除。
+- **緊急停止只是軟體命令**(`ctrl.c:277-278`),訊息翻回自動清除;獨立的硬體 shutdown circuit 是否存在**未驗證**。
+- **錯誤事件可能漏掉**:`states/err.c:72-74` 的 `@todo`,轉換進行中時錯誤事件被丟棄,不會事後補評估。
+- **倒檔**只檢查煞車 ≥ 50%(車速條件被註解),反向扭矩限 10。
+- **BMS 通訊遺失容忍 60 秒且僅 WARN**。
+
+**執行緒與資料競爭:**
+- zbus listener 無鎖寫入 `g_ctx`(`ctrl.c:255-266`),控制緒在鎖內讀;多欄位結構可能被撕裂(例如油門與煞車不同步)。
+- 控制迴圈用 `k_sleep(10ms)`,週期為 10 ms 加執行時間而有漂移;拿不到鎖(5 ms)只記警告並**跳過整個週期**,沿用最後的扭矩指令。VCU 端有無輸出逾時 / 看門狗**未驗證**。
+- `volatile double` 參數 getter 無鎖,在 Cortex-M7 上 64 位元讀取不保證不被撕裂。
+
+**命令與參數:** `ctrl param set` **沒有範圍檢查**且立刻寫入快閃(`shell.c:182-198`),可設負值或超過 20 Nm 並在斷電後保留(Simulink 端是否再飽和未驗證);只有儀表板路徑有 `CLAMP`。USB shell 可手動強制狀態轉換、置位/清除錯誤,無驗證(需實體存取)。
+
+### 9.5 儀表板
+
+**韌體端:** 三種模式 NORMAL / SETTING / TEST,`RTD_SOUND` 與 `RUNNING` 期間禁止切換。**沒有獨立執行緒**,全部由 zbus 監聽器與 input callback 在發佈者執行緒內同步執行。11 顆 74HC595 串接(SPI4 5 MHz,每次約 18 µs,只在輸出值改變時才送出,不易閃爍)。
+
+**需注意:**
+- 資料中斷時**顯示凍結在最後一個值**,沒有逾時標示;只有逆變器心跳錯誤才顯示 "Er"。CAN bus-off、SD 卡故障、低壓(`pow_low`)沒有駕駛端指示(未驗證)。
+- **RTD 鍵長按直接 `sys_reset()`**,沒有狀態檢查(`peripherals.c:111`),行駛中誤觸會重啟 VCU。
+- 設定模式**每按一格(含長按連發)就寫一次快閃**(`setting.c:222,233,243`),快閃磨損;亮度可設為 0,連 "Er" 都看不到。
+- `dashboard.c:262` 的 `static char buf[20]` 與 `accel_rgb/brake_rgb` 在多執行緒共用且未加鎖;`normal.c:363-364` 在已加鎖後 `default: return;` 未解鎖(目前被篩選器擋住,屬潛在問題)。
+- 74HC595 位元順序是否與實體接線一致、開機初值、OE 控制:未驗證。
+
+**RPi 端(`Dashboard_Games`):** CAN 讀取是 daemon 執行緒,與 pygame 主迴圈以 lock 分離,斷線每 2 秒重連;資料逾時 1 秒會標示年齡,**這點做得好**。只讀不送,不影響車輛。預設只用 can1、無核心過濾器,全部交給純 Python 解碼(CM4 負載未驗證)。`game.py:174` 把 "can1" 寫死在文字中。沒有看到開機自啟。`GUI-dev` 子模組為空,`canlogging-v4.py` 未能分析。
+
+### 9.6 建議驗證計畫
+
+**單元 / 模擬(不需硬體):**
+1. `ztest` + `native_sim`:完整狀態轉換表,**特別是 RTD_FORCED 從 ERROR 進入**後的行為。
+2. 為 OD.c 的 PDO 映射寫一致性檢查腳本(RPDO 目標物件應與節點一致),可直接抓到第 1 項類型的錯誤。
+3. 逆變器端把 RMS 保護與扭矩斜坡抽成純函式,在主機上做單元測試(溢位、整數除法)。
+
+**HIL / 實機:**
+4. APPS 單顆斷線、兩顆偏差 > 10% 持續 100 ms、油門加煞車同踩。
+5. 控制鎖逾時後扭矩是否停留;逆變器收不到控制幀(量測實際關斷時間);FL/FR 逆變器心跳中斷;BMS 失聯。
+6. 持續性逆變器故障下的 fault reset 迴圈;`param set` 極端值斷電重啟。
+7. 示波器:ADC 取樣時間點與 PWM 相位;ISR 實際耗時(開啟 `TIMING`);確認 TIM1 實際時脈(若 240 MHz,PWM 約 23.4 kHz,與 `Ts=1/23000` 約差 1.7%)。
+8. 用實測電流校驗 `ACAPLSB`/`DCAPLSB`;確認硬體 SR 閂鎖重置路徑與 `GATE_EN` 在 ISR 凍結時是否仍有效。
+9. CAN bus-off 與總線錯誤下的 VCU / 逆變器 / 儀表板行為。
+
+**仍待深入:** `ctrl_inv_fault_reset` 在行駛中的行為、EP7 實車是否使用這份 OD.c(是否另有 EDS 產生)、OD 是否被持久化覆蓋、`ws2812` 48 顆(spi2 + DMA)的用途、`Inverter_TI` 的舊控制是否仍有參考價值。
