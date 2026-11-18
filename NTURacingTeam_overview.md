@@ -167,3 +167,63 @@
 - `nturt_kicad*` 的 PCB 內容
 - `GUI-dev` 子模組(`Ktliu-Tyler/rpi_can_monitor`)
 - `ROS_server` 與 `RPI_Desktop` 的資安審查
+
+---
+
+## 8. EP7 現行專案深入分析(2026-11 補充)
+
+### 8.1 EP7 組成
+`nturt_kicad_EP7`(硬體)、`nturt_zephyr_common`(含 `ep7_vcu` 板)、`nturt_vcu`、`RPI_Desktop`、`Dashboard_Games`,基礎是 `zephyr` fork 與 `zephyr_workspace`。
+
+**硬體(依 KiCad 檔字串推斷,未開 KiCad 驗證):**
+- 動力組:自製分立式逆變器(`INV_Discrete_*`:控制、隔離、功率、電流感測),閘極驅動 Infineon 1ED3122MC12H,TO-247-4 封裝、LEM CKSR 電流感測、TDK CeraLink 直流鏈電容;`INV_Boost_*`(用途不明);`DIY_MGJ6` 隔離閘極電源;`MOT_EncTemp`(TI LDC5072,2026-10-15 才 V1.0);`ACC_BMSslave`。
+- 電控組:`VCU_CM4`/`VCU_CM5`(Raspberry Pi 運算模組載板)、`Dash_Screen`、`Steering_Panel`、`DIY_IMU`(BNO085)、`Tire_Temp`(MLX90640)、`PCAN_PRO`、`DEV_UPS`。
+
+**`ep7_vcu` 板(STM32H743ZI):** FDCAN1/2、SD 卡 FatFS、USB、RTC、蜂鳴器、輸入電壓監控;感測器為方向盤、APPS1/2、BSE1/2、4 個懸吊位移。相較 EP6,VCU 板上移除了煞車燈、RTD 燈、CANopen LED、IMU、5V 電流感測與 SPI 顯示器,這些功能改由儀表板與其他板子負責,IMU 改走 CANopen。
+
+### 8.2 CAN 位元率:已確認一致(1 Mbit/s)
+| 位置 | 設定 |
+|---|---|
+| `ep7_vcu.dts` fdcan1/fdcan2 | 1,000,000 bps,取樣點 80% |
+| `RPI_Desktop/scripts/start_can.sh` | can0/can1 皆 1,000,000 |
+| `nturt_zephyr_common` CANopenNode | `CANOPENNODE_BITRATE` 預設 1000 kbit/s |
+| `nturt_INV_STM32H743ZI` | FDCAN 核心時脈 30 MHz(.ioc 的 `RCC.FDCANFreq_Value`),預分頻 10 → 3 MHz;每位元 3 tq → 1 Mbit/s |
+
+先前引用的 500 kbps 來自舊的 `nturt_ep5_rear_box` 文件,已不適用於 EP7。
+
+**小問題:** 逆變器端每位元只有 3 個時間量子(同步 1 + Seg1 1 + Seg2 1),取樣點約 66.7%,與 VCU 的 80% 不同,解析度也低。短線纜可運作,但線長增加或雜訊大時裕度較小,建議改成 10 tq 以上(例如預分頻 3、Seg1 7、Seg2 2 → 80%)。
+
+### 8.3 CAN 協定:逆變器端不是 CANopen 協定棧
+`nturt_INV_STM32H743ZI` 用自訂 ID 方案(`canid.h`):狀態 0x190、狀態機 0x290、溫度 0x390、控制 0x210、設定 0x110、心跳 0x710、參數 0x730,各加上 `MOT_ID`(1–4)。只有 TX 標頭與一個 RX 過濾器(控制幀),沒有物件字典或 SDO。
+
+VCU 端用 CANopen,透過 `src/canopen/msg.c` 把物件字典項目(如 0x2111、0x2113)聚合成 zbus 訊息。DBC(`NTUR_EP6_260617.dbc`)則同時涵蓋兩者:VCU 是 CANopen 風格 ID(0x181 Cockpit、0x701 心跳),逆變器是上述自訂 ID(INV1–4 的 Status、狀態機、溫度、TI_Log、心跳、PID_Feedback,以及 VCU 發出的 INVCMD1–4)。所以現行協定是「CANopen 與自訂 ID 混合」,需靠 DBC 與物件字典兩份文件才完整。**我沒有驗證 VCU 的 PDO 對映是否真的接收這些自訂 ID。**
+
+### 8.4 逆變器保護電路(`INV_Discrete_Controller`)
+依圖紙架構與零件(未追完整網表):
+- `Isense_OCP`:U/V/W 相電流與直流電流經比較器(LM393)比較門檻,輸出 `OC&OT_Falut`。
+- `OCPnode`、`OTPnode`、`TsenseNode`:過電流、過溫比較節點,各自帶 `GateEnablePull`。
+- `SR_Latch`:由 74AUP1G00(NAND)與 74AUP1G07 組成的閂鎖,有 S、R、Q、!Q 四個端子。
+- `PWM_Enable`:共 5 個實例,每個把 PWM 與 `enable` 閘控後輸出。
+- 頂層網路:`GATE_EN`/`!GATE_EN`、`OCPFLTN`、`GATE_ENC`、`NRST`。
+
+設計意圖:過電流或過溫由類比比較器直接觸發閂鎖並關閉閘極致能,不經過 MCU 軟體,**這是正確的高壓安全設計方向**。限制:我沒有追蹤閂鎖的重置路徑(誰可以清除)、比較器門檻是否由電位器設定(`threshold` 為 R_Potentiometer)、也沒有看到實測或 FMEA 文件。
+
+### 8.5 `RPI_Desktop` 網頁伺服器資安檢查(`CAN_web/CanServer.py`)
+| 嚴重度 | 問題 | 位置 |
+|---|---|---|
+| **高** | **儲存型 XSS。** 儀表板前端把收到的資料(`data.gps.lat`、`inv.name` 等)直接用模板字串寫入 `innerHTML`,沒有跳脫;任何人可 POST 惡意欄位,透過 WebSocket 廣播到所有觀看者的瀏覽器執行。 | 前端 `updateDashboard`(約第 307–413 行) |
+| **高** | **`POST /api/can-data` 無驗證。** 能連到 8000 埠的任何人都能注入假遙測並廣播給所有觀看者,與上一項組合成完整攻擊鏈。 | 第 103 行 |
+| 中 | 預設綁定 `0.0.0.0:8000`(`HOST` 環境變數預設值),所有網卡都暴露,包括比賽現場的 WiFi。 | 第 437 行附近 |
+| 中 | CORS 為 `allow_origins=["*"]` 且 `allow_credentials=True`;WebSocket 不檢查 Origin,任何網頁都能跨站讀取即時資料或發送 POST。程式註解也寫著「生產環境請調整」。 | 第 50–55 行 |
+| 低 | 輸入為 `Dict[str, Any]`,沒有大小上限或結構驗證;每筆都廣播並寫日誌,可被拿來耗盡資源。 | 第 103 行 |
+| 低 | 客戶端寫死 Tailscale IP `http://100.97.75.73:8000`,明碼 HTTP;好在流量走 Tailscale 隧道。IP 屬私有位址空間,但仍建議移出程式碼。 | `CanClient.py` |
+| 低 | `requirements.txt` 是 `pip freeze` 輸出,含舊版套件(例如 `cryptography==38.0.4`),需另行盤點漏洞。 | `requirements.txt` |
+
+沒有發現寫死的密碼或金鑰(以常見關鍵字掃描,結果為空)。伺服器只做顯示,沒有看到回寫到 CAN 的路徑,所以**不會直接控制車輛**,風險集中在資訊正確性與觀看者瀏覽器。
+
+**建議修法(依優先順序):**
+1. 前端改用 `textContent`,或在寫入前跳脫 HTML。
+2. `/api/can-data` 加上簡單的共享金鑰標頭或限定來源 IP(Tailscale 網段)。
+3. 預設綁定改為 `127.0.0.1` 或 Tailscale 介面;CORS 限定實際來源,並把 `allow_credentials` 關掉。
+4. 檢查 WebSocket 的 `Origin`。
+5. 以 pydantic 模型限制欄位型別與大小。
